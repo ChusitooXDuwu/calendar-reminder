@@ -1,0 +1,36 @@
+name: mail-watcher
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"  # GitHub puede retrasarlo unos minutos en horas pico
+  workflow_dispatch: {}
+
+concurrency:
+  group: mail-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python watcher.py
+        env:
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL }}
+          MY_EMAIL: ${{ vars.MY_EMAIL }}
+          VIP_SENDERS: ${{ vars.VIP_SENDERS }}
+          IMPORTANT_DOMAINS: ${{ vars.IMPORTANT_DOMAINS }}
+          NOISE_SENDERS: ${{ vars.NOISE_SENDERS }}
+          NOISE_KEYWORDS: ${{ vars.NOISE_KEYWORDS }}
