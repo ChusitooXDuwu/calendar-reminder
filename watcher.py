@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mail Watcher: revisa Gmail y avisa solo de lo importante.
+"""Mail Watcher: revisa Gmail y avisa de todo lo que no sea promocional.
 
 Modos:
   python watcher.py                 -> modo nube (GitHub Actions): avisa por Slack/ntfy
@@ -33,15 +33,10 @@ import requests
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 STATE_DIR = Path(os.environ.get("MAIL_WATCHER_HOME", Path.home() / ".mail-watcher"))
 
-DEFAULT_NOISE_SENDERS = [
-    "no-reply", "noreply", "do-not-reply", "donotreply", "notifications@", "notification@",
-    "mailer-daemon", "statuspage", "linear.app", "insideapple.apple.com", "email.apple.com",
-    "stripe.com", "github.com", "openai.com", "mail.slash.com", "auth.", "authentication@",
-    "banking@", "news@", "newsletter", "marketing", "updates.", "conductor.build",
-]
-DEFAULT_NOISE_KEYWORDS = ["sandbox", "verification code", "codigo de verificacion", "código de verificación"]
+# Solo se ignora lo promocional (pestana "Promociones" de Gmail). Todo lo demas avisa.
+# Si algo especifico molesta, agregalo a NOISE_SENDERS / NOISE_KEYWORDS (variables).
 FORWARD_RE = re.compile(r"^\s*(fwd?|rv|reenviado|tr)\s*:", re.I)
-NOISE_CATEGORIES = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"}
+PROMO_CATEGORIES = {"CATEGORY_PROMOTIONS"}
 
 
 def load_dotenv(path: Path) -> None:
@@ -77,8 +72,8 @@ class Config:
             me=os.environ.get("MY_EMAIL", "").lower(),
             vip_senders=env_list("VIP_SENDERS"),
             important_domains=env_list("IMPORTANT_DOMAINS"),
-            noise_senders=env_list("NOISE_SENDERS", DEFAULT_NOISE_SENDERS),
-            noise_keywords=env_list("NOISE_KEYWORDS", DEFAULT_NOISE_KEYWORDS),
+            noise_senders=env_list("NOISE_SENDERS"),
+            noise_keywords=env_list("NOISE_KEYWORDS"),
             label_name=os.environ.get("NOTIFIED_LABEL", "Claude-Notificado"),
             lookback=os.environ.get("LOOKBACK", "1d"),
         )
@@ -94,7 +89,7 @@ class Mail:
     snippet: str
     label_ids: list[str]
     headers: dict[str, str] = field(default_factory=dict)
-    priority: str = ""  # "alta" | "media" | ""
+    priority: str = ""  # "alta" | "media" | "baja" | "" (= no avisar)
     reason: str = ""
 
     @property
@@ -162,39 +157,38 @@ class Gmail:
 # ---------------------------------------------------------------- Clasificacion
 
 def classify(m: Mail, cfg: Config) -> Mail:
+    """Avisa todo menos lo promocional. La prioridad solo cambia el orden y el icono."""
     sender, domain = m.sender, m.sender.split("@")[-1]
     text = f"{m.subject} {m.snippet}".lower()
     forwarded = bool(FORWARD_RE.match(m.subject))
 
     if sender in cfg.vip_senders:
         m.priority, m.reason = "alta", "VIP"
-    elif any(k in text for k in cfg.noise_keywords):
-        m.reason = "ruido (palabra clave)"
-    elif any(p in sender for p in cfg.noise_senders):
-        m.reason = "ruido (remitente automatico)"
+    elif cfg.noise_senders and any(p in sender for p in cfg.noise_senders):
+        m.reason = "silenciado (NOISE_SENDERS)"
+    elif cfg.noise_keywords and any(k in text for k in cfg.noise_keywords):
+        m.reason = "silenciado (NOISE_KEYWORDS)"
+    elif PROMO_CATEGORIES & set(m.label_ids):
+        m.reason = "promocional"
+    elif forwarded:
+        m.priority, m.reason = "alta", "reenvio"
     elif domain in cfg.important_domains:
-        m.priority = "alta" if forwarded else "media"
-        m.reason = "reenvio del equipo/cliente" if forwarded else f"dominio importante ({domain})"
-    elif NOISE_CATEGORIES & set(m.label_ids):
-        m.reason = "ruido (categoria promo/social)"
-    elif m.headers.get("list-unsubscribe") or m.headers.get("precedence", "").lower() in {"bulk", "list"} \
-            or m.headers.get("auto-submitted", "no").lower() != "no":
-        m.reason = "ruido (correo masivo/automatico)"
+        m.priority, m.reason = "media", f"dominio importante ({domain})"
     else:
-        m.priority, m.reason = "media", "persona real"
-    if m.priority and forwarded and m.priority != "alta":
-        m.priority = "alta"
+        m.priority, m.reason = "baja", "otro"
     return m
 
 
 # ---------------------------------------------------------------- Avisos
 
 def slack_text(important: list[Mail], vip: set[str]) -> str:
-    lines = [":rotating_light: *CORREO IMPORTANTE — léelo* :rotating_light:"]
-    for m in important:
-        icon = ":red_circle:" if m.priority == "alta" else ":large_yellow_circle:"
-        who = ":bust_in_silhouette: *JP/VIP te escribió* — " if m.sender in vip else ""
+    lines = [":rotating_light: *CORREO NUEVO — léelo* :rotating_light:"]
+    for m in important[:15]:
+        icon = {"alta": ":red_circle:", "media": ":large_yellow_circle:"}.get(m.priority, ":white_circle:")
+        who = ":bust_in_silhouette: *VIP* — " if m.sender in vip else ""
         lines.append(f"\n{icon} {who}*{m.sender_name}* <{m.sender}>\n*{m.subject}*\n> {m.snippet[:220]}\n<{m.url}|Abrir en Gmail>")
+    if len(important) > 15:
+        lines.append(f"\n…y {len(important) - 15} más. <https://mail.google.com/mail/u/0/#inbox|Abrir Gmail>")
     return "\n".join(lines)
 
 
@@ -217,11 +211,12 @@ def notify_ntfy(important: list[Mail], cfg: Config) -> None:
     if not topic:
         return
     top = important[0]
-    urgent = any(m.priority == "alta" for m in important)
+    level = "urgent" if any(m.priority == "alta" for m in important) else \
+        "high" if any(m.priority == "media" for m in important) else "default"
     body = "\n".join(f"• {m.sender_name}: {m.subject}" for m in important)
     requests.post(f"{os.environ.get('NTFY_SERVER', 'https://ntfy.sh')}/{topic}", data=body.encode(), timeout=20,
-                  headers={"Title": f"CORREO IMPORTANTE ({len(important)})".encode(),
-                           "Priority": "urgent" if urgent else "high",
+                  headers={"Title": f"CORREO NUEVO ({len(important)})".encode(),
+                           "Priority": level,
                            "Tags": "rotating_light,email", "Click": top.url}).raise_for_status()
 
 
@@ -243,9 +238,9 @@ p.sub{{text-align:center;font-size:20px;margin:0 0 24px}}
 @keyframes b{{50%{{opacity:.35}}}}
 .wrap{{max-width:820px;margin:0 auto;padding:0 16px 40px}}
 .card{{display:block;background:#fff;color:#111;border-radius:12px;padding:18px 20px;margin:12px 0;text-decoration:none;border-left:10px solid #f5b700}}
-.card.alta{{border-left-color:#ff1744}} .who{{font-weight:600}} .subj{{font-size:20px;margin:4px 0}} .snip{{color:#555}}
+.card.alta{{border-left-color:#ff1744}} .card.baja{{border-left-color:#bbb}} .who{{font-weight:600}} .subj{{font-size:20px;margin:4px 0}} .snip{{color:#555}}
 </style></head><body><h1>🚨 CORREO LLEGÓ — LÉELO 🚨</h1>
-<p class="sub">{len(important)} correo(s) importante(s). Click para abrir en Gmail.</p>
+<p class="sub">{len(important)} correo(s) nuevo(s). Click para abrir en Gmail.</p>
 <div class="wrap">{cards}</div></body></html>""")
     webbrowser.open(page.as_uri())
 
@@ -285,11 +280,11 @@ def run_once(args, cfg: Config) -> None:
     seen, seen_path = seen_state() if args.local else (set(), None)
     ids = [i for i in ids if i not in seen]
     mails = [classify(gmail.get(i), cfg) for i in ids]
-    important = sorted([m for m in mails if m.priority], key=lambda m: (m.priority != "alta", m.sender not in cfg.vip_senders))
+    important = sorted([m for m in mails if m.priority], key=lambda m: ("alta", "media", "baja").index(m.priority))
 
     for m in mails:
         print(f"[{m.priority or 'ruido':5}] {m.sender:40} {m.subject[:60]}  ({m.reason})")
-    print(f"{len(mails)} nuevos, {len(important)} importantes")
+    print(f"{len(mails)} nuevos, {len(important)} para avisar")
     if args.dry_run:
         return
 

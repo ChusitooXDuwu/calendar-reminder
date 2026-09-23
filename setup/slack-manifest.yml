@@ -1,0 +1,18 @@
+# api.slack.com/apps -> Create New App -> From a manifest -> pega esto
+display_information:
+  name: Mail Watcher
+  description: Te avisa por DM cuando llega un correo que no es promocional
+  background_color: "#b00020"
+features:
+  bot_user:
+    display_name: Mail Watcher
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - im:write
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
